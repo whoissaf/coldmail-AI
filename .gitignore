@@ -1,1 +1,6 @@
 .env
+
+# Python & Database
+__pycache__/
+*.py[cod]
+*.db
