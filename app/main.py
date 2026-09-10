@@ -1,17 +1,29 @@
 import time
 import random
 import bcrypt
+import os
 from datetime import timedelta, datetime, timezone
 from fastapi import FastAPI, Depends, HTTPException, status, Header
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 
 from app.database import engine, get_db, Base
-from app import models, schemas, auth, llm_service, email_validator, web3_service
+from app import models, schemas, auth, llm_service, email_validator, email_service, web3_service
 
 Base.metadata.create_all(bind=engine)
 app = FastAPI(title="ColdGenius AI Backend", version="1.0.0")
 
-WEBHOOK_SECRET = "coldgenius-webhook-secret-123"
+# --- TAMBAHAN BARU: IZINKAN CORS AGAR FRONTEND BISA AKSES BACKEND ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], # Mengizinkan semua origin (aman untuk development lokal)
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+# --------------------------------------------------------------------
+
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "coldgenius-webhook-secret-123")
 
 def get_password_hash(password: str) -> str:
     pwd_bytes = password.encode('utf-8')
@@ -24,7 +36,7 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
 
 @app.get("/")
 def read_root():
-    return {"message": "ColdGenius AI Backend is running"}
+    return {"message": "ColdGenius AI Backend is running (Production Mode)"}
 
 @app.post("/register", response_model=schemas.UserResponse, status_code=status.HTTP_201_CREATED)
 def register(user: schemas.UserCreate, db: Session = Depends(get_db)):
@@ -73,6 +85,13 @@ def delete_campaign(campaign_id: int, current_user: models.User = Depends(auth.g
     db.delete(campaign)
     db.commit()
     return None
+
+@app.get("/campaigns/{campaign_id}/prospects", response_model=list[schemas.ProspectResponse])
+def get_prospects(campaign_id: int, current_user: models.User = Depends(auth.get_current_user), db: Session = Depends(get_db)):
+    campaign = db.query(models.Campaign).filter(models.Campaign.id == campaign_id, models.Campaign.user_id == current_user.id).first()
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found or access denied")
+    return db.query(models.Prospect).filter(models.Prospect.campaign_id == campaign_id).all()
 
 @app.post("/campaigns/{campaign_id}/prospects", response_model=schemas.ProspectResponse, status_code=status.HTTP_201_CREATED)
 def add_prospect(campaign_id: int, prospect: schemas.ProspectCreate, current_user: models.User = Depends(auth.get_current_user), db: Session = Depends(get_db)):
@@ -141,11 +160,22 @@ def send_email(campaign_id: int, prospect_id: int, current_user: models.User = D
     if email_record.prospect.validation_status == "risky":
         print(f"⚠️ WARNING: Sending to risky email provider: {email_record.prospect.email}")
 
-    print(f"🛡️ ANTI-SPAM LOGIC: Simulating random delay before sending to {email_record.prospect.email}")
+    print(f"📤 SENDING REAL EMAIL via Resend to {email_record.prospect.email}...")
+    send_result = email_service.send_real_email(
+        to_email=email_record.prospect.email,
+        subject=email_record.subject,
+        body=email_record.body
+    )
+    
+    if send_result["status"] == "failed":
+        raise HTTPException(status_code=500, detail=f"Failed to send email: {send_result['error']}")
+
     email_record.status = "sent"
     email_record.sent_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(email_record)
+    
+    print(f"✅ SUCCESS: Real email sent! Resend ID: {send_result['email_id']}")
     return email_record
 
 @app.post("/webhooks/email-tracking")
@@ -183,7 +213,6 @@ def get_campaign_analytics(campaign_id: int, current_user: models.User = Depends
     reply_rate = (emails_replied / emails_sent * 100) if emails_sent > 0 else 0.0
     return {"campaign_id": campaign_id, "total_prospects": total_prospects, "emails_sent": emails_sent, "emails_opened": emails_opened, "emails_replied": emails_replied, "open_rate": round(open_rate, 2), "reply_rate": round(reply_rate, 2)}
 
-# --- TAHAP 8: WEB3 TIMESTAMP (IMMUTABLE PROOF) ---
 @app.post("/campaigns/{campaign_id}/prospects/{prospect_id}/emails/{email_id}/timestamp", response_model=schemas.Web3TimestampResponse)
 def timestamp_email_on_blockchain(
     campaign_id: int, 
@@ -220,5 +249,4 @@ def timestamp_email_on_blockchain(
     db.commit()
     db.refresh(new_timestamp)
     
-    print(f"✅ WEB3 SUCCESS: Email {email_id} immutably stored at block {chain_data['block_number']}")
     return new_timestamp
